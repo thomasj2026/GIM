@@ -133,7 +133,7 @@ bool create_entities() {
 
   RCCHECK(rclc_publisher_init_default(&pub_gps, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, NavSatFix), "/gps_stern/fix"));
   RCCHECK(rclc_publisher_init_default(&pub_imu, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Imu), "/imu_stern/data"));
-  RCCHECK(rclc_publisher_init_default(&pub_rtcm_out, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt8MultiArray), "/gps_stern/moving_base_rtcm"));
+  RCCHECK(rclc_publisher_init_default(&pub_rtcm_out, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt8MultiArray), "/rtcm_moving_base"));
 
   RCCHECK(rclc_subscription_init_default(&sub_rtcm_in, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt8MultiArray), "/rtcm_land"));
 
@@ -170,7 +170,6 @@ void setup() {
   myGNSS.setDynamicModel(DYN_MODEL_SEA);
   myGNSS.setUART1Output(COM_TYPE_UBX | COM_TYPE_RTCM3); 
   myGNSS.setUART1Input(COM_TYPE_UBX | COM_TYPE_RTCM3);
-  
   
   myGNSS.setAutoPVT(true);
   myGNSS.setAutoPVTcallbackPtr(&pvtCallback); 
