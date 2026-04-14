@@ -2,7 +2,8 @@
 //  bow_firmware.cpp  –  Localization Front (Bow) Node
 //  Publishes: /gps_bow/fix, /imu_bow/data, /gps_bow/heading,
 //             /gps_bow/velocity
-//  Subscribes: /rtcm_moving_base
+//  Subscribes: /rtcm_land        (land base  -> absolute RTK fix)
+//              /rtcm_moving_base (stern base -> moving baseline heading)
 // ============================================================
 #include <Arduino.h>
 #include <Wire.h>
@@ -21,7 +22,8 @@
 
 // --- Forward Declarations ---
 void imu_timer_callback(rcl_timer_t *timer, int64_t last_call_time);
-void rtcm_callback(const void *msvin);
+void rtcm_moving_base_callback(const void *msvin);
+void rtcm_land_callback(const void *msvin);
 void pvtCallback(UBX_NAV_PVT_data_t *ubxDataStruct);
 void relposnedCallback(UBX_NAV_RELPOSNED_data_t *ubxDataStruct);
 bool read_imu_burst();
@@ -34,19 +36,24 @@ Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28);
 
 // --- ROS 2 Entities ---
 rcl_publisher_t    pub_gps, pub_imu, pub_heading, pub_vel;
-rcl_subscription_t sub_rtcm;
+rcl_subscription_t sub_rtcm_moving_base, sub_rtcm_land;
 rcl_timer_t        timer_imu;
 
 sensor_msgs__msg__NavSatFix                    msg_gps;
 sensor_msgs__msg__Imu                          msg_imu;
 geometry_msgs__msg__PoseWithCovarianceStamped  msg_heading;
 geometry_msgs__msg__TwistWithCovarianceStamped msg_vel;
-std_msgs__msg__UInt8MultiArray                 msg_rtcm_in;
+std_msgs__msg__UInt8MultiArray                 msg_rtcm_moving_base_in;
+std_msgs__msg__UInt8MultiArray                 msg_rtcm_land_in;
 
 rclc_support_t  support;
 rcl_allocator_t allocator;
 rcl_node_t      node;
 rclc_executor_t executor;
+
+// --- RTCM receive buffers ---
+uint8_t rtcm_moving_base_buf[1024];
+uint8_t rtcm_land_buf[1024];
 
 // --- Frame IDs ---
 static char gps_frame[]  = "gps_bow_link";
@@ -68,9 +75,20 @@ states state = WAITING_AGENT;
 #define RCCHECK(fn) { rcl_ret_t rc = fn; if (rc != RCL_RET_OK) return false; }
 
 // ============================================================
-//  RTCM Subscriber – forward land-base corrections to u-blox
+//  RTCM Subscribers
+//  Both write directly to Serial1 (u-blox UART).
+//  The F9P accepts mixed RTCM streams on the same port —
+//  it will use Type 4072 for moving baseline and standard
+//  MSM messages for its own absolute RTK fix.
 // ============================================================
-void rtcm_callback(const void *msvin) {
+void rtcm_moving_base_callback(const void *msvin) {
+  const std_msgs__msg__UInt8MultiArray *msg =
+      (const std_msgs__msg__UInt8MultiArray *)msvin;
+  if (msg->data.size > 0)
+    Serial1.write(msg->data.data, msg->data.size);
+}
+
+void rtcm_land_callback(const void *msvin) {
   const std_msgs__msg__UInt8MultiArray *msg =
       (const std_msgs__msg__UInt8MultiArray *)msvin;
   if (msg->data.size > 0)
@@ -153,7 +171,11 @@ void pvtCallback(UBX_NAV_PVT_data_t *ubxDataStruct) {
   msg_gps.longitude = ubxDataStruct->lon  / 10000000.0;
   msg_gps.altitude  = ubxDataStruct->hMSL / 1000.0;
 
-  msg_gps.status.status  = (ubxDataStruct->flags.bits.diffSoln) ? 2 : 0;
+  // Reflect RTK convergence state in status
+  uint8_t carrSoln = ubxDataStruct->flags.bits.carrSoln;
+  if      (carrSoln == 2) msg_gps.status.status = 2;  // RTK fixed
+  else if (carrSoln == 1) msg_gps.status.status = 1;  // RTK float
+  else                    msg_gps.status.status = 0;  // standard fix
   msg_gps.status.service = 1;  // SERVICE_GPS
 
   float hAcc = ubxDataStruct->hAcc / 1000.0f;  // mm -> m
@@ -178,18 +200,16 @@ void pvtCallback(UBX_NAV_PVT_data_t *ubxDataStruct) {
 
     msg_vel.header.stamp.sec     = t / 1000000000;
     msg_vel.header.stamp.nanosec = t % 1000000000;
-    // Published in base_link frame so robot_localization can fuse it directly
     msg_vel.header.frame_id.data = base_frame;
     msg_vel.header.frame_id.size = strlen(base_frame);
 
     msg_vel.twist.twist.linear.x  = ubxDataStruct->velE / 1000.0f;  // East  -> X
     msg_vel.twist.twist.linear.y  = ubxDataStruct->velN / 1000.0f;  // North -> Y
-    msg_vel.twist.twist.linear.z  = 0.0f;   // ignored in two_d_mode
+    msg_vel.twist.twist.linear.z  = 0.0f;
     msg_vel.twist.twist.angular.x = 0.0f;
     msg_vel.twist.twist.angular.y = 0.0f;
     msg_vel.twist.twist.angular.z = 0.0f;
 
-    // 6x6 row-major covariance [vx, vy, vz, wx, wy, wz]
     for (int i = 0; i < 36; i++) msg_vel.twist.covariance[i] = 0.0;
     msg_vel.twist.covariance[0]  = sAcc2;  // vx variance (m²/s²)
     msg_vel.twist.covariance[7]  = sAcc2;  // vy variance
@@ -200,14 +220,15 @@ void pvtCallback(UBX_NAV_PVT_data_t *ubxDataStruct) {
 }
 
 // ============================================================
-//  RELPOSNED Callback – dual-antenna heading
+//  RELPOSNED Callback – dual-antenna moving baseline heading
 // ============================================================
 void relposnedCallback(UBX_NAV_RELPOSNED_data_t *ubxDataStruct) {
   if (state != AGENT_CONNECTED) return;
 
-  if (!ubxDataStruct->flags.bits.gnssFixOK)          return;
-  if (!ubxDataStruct->flags.bits.diffSoln)            return;
-  if (!ubxDataStruct->flags.bits.relPosHeadingValid)  return;
+  // All three flags must be set for a valid heading
+  if (!ubxDataStruct->flags.bits.gnssFixOK)         return;
+  if (!ubxDataStruct->flags.bits.diffSoln)           return;
+  if (!ubxDataStruct->flags.bits.relPosHeadingValid) return;
 
   int64_t t = rmw_uros_epoch_nanos();
   msg_heading.header.stamp.sec     = t / 1000000000;
@@ -215,6 +236,7 @@ void relposnedCallback(UBX_NAV_RELPOSNED_data_t *ubxDataStruct) {
   msg_heading.header.frame_id.data = gps_frame;
   msg_heading.header.frame_id.size = strlen(gps_frame);
 
+  // relPosHeading is in degrees * 1e-5, convert to radians
   double heading_rad = (ubxDataStruct->relPosHeading / 100000.0) * (PI / 180.0);
   msg_heading.pose.pose.orientation.x = 0.0;
   msg_heading.pose.pose.orientation.y = 0.0;
@@ -222,6 +244,7 @@ void relposnedCallback(UBX_NAV_RELPOSNED_data_t *ubxDataStruct) {
   msg_heading.pose.pose.orientation.w = cos(heading_rad / 2.0);
 
   for (int i = 0; i < 36; i++) msg_heading.pose.covariance[i] = 0.0;
+  // accHeading is in degrees * 1e-5, convert to radians² for covariance
   double headingAcc_rad = (ubxDataStruct->accHeading / 100000.0) * (PI / 180.0);
   msg_heading.pose.covariance[35] = headingAcc_rad * headingAcc_rad;
 
@@ -236,6 +259,7 @@ bool create_entities() {
   RCCHECK(rclc_support_init(&support, 0, NULL, &allocator));
   RCCHECK(rclc_node_init_default(&node, "localizationFrontNode", "", &support));
 
+  // Publishers
   RCCHECK(rclc_publisher_init_default(&pub_gps,     &node,
       ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs,   msg, NavSatFix),                  "/gps_bow/fix"));
   RCCHECK(rclc_publisher_init_default(&pub_imu,     &node,
@@ -245,15 +269,30 @@ bool create_entities() {
   RCCHECK(rclc_publisher_init_default(&pub_vel,     &node,
       ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, TwistWithCovarianceStamped), "/gps_bow/velocity"));
 
-  RCCHECK(rclc_subscription_init_default(&sub_rtcm, &node,
+  // Subscriptions
+  RCCHECK(rclc_subscription_init_default(&sub_rtcm_moving_base, &node,
       ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt8MultiArray), "/rtcm_moving_base"));
+  RCCHECK(rclc_subscription_init_default(&sub_rtcm_land, &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt8MultiArray), "/rtcm_land"));
+
+  // Pre-assign static buffers
+  msg_rtcm_moving_base_in.data.capacity = sizeof(rtcm_moving_base_buf);
+  msg_rtcm_moving_base_in.data.data     = rtcm_moving_base_buf;
+  msg_rtcm_moving_base_in.data.size     = 0;
+
+  msg_rtcm_land_in.data.capacity = sizeof(rtcm_land_buf);
+  msg_rtcm_land_in.data.data     = rtcm_land_buf;
+  msg_rtcm_land_in.data.size     = 0;
 
   RCCHECK(rclc_timer_init_default(&timer_imu, &support, RCL_MS_TO_NS(20), imu_timer_callback));
 
-  RCCHECK(rclc_executor_init(&executor, &support.context, 2, &allocator));
+  // 3 handles: timer + sub_rtcm_moving_base + sub_rtcm_land
+  RCCHECK(rclc_executor_init(&executor, &support.context, 3, &allocator));
   RCCHECK(rclc_executor_add_timer(&executor, &timer_imu));
-  RCCHECK(rclc_executor_add_subscription(&executor, &sub_rtcm, &msg_rtcm_in,
-                                         &rtcm_callback, ON_NEW_DATA));
+  RCCHECK(rclc_executor_add_subscription(&executor, &sub_rtcm_moving_base,
+      &msg_rtcm_moving_base_in, &rtcm_moving_base_callback, ON_NEW_DATA));
+  RCCHECK(rclc_executor_add_subscription(&executor, &sub_rtcm_land,
+      &msg_rtcm_land_in, &rtcm_land_callback, ON_NEW_DATA));
 
   rmw_uros_sync_session(1000);
   return true;
@@ -267,7 +306,8 @@ void destroy_entities() {
   rcl_publisher_fini(&pub_imu,     &node);
   rcl_publisher_fini(&pub_heading, &node);
   rcl_publisher_fini(&pub_vel,     &node);
-  rcl_subscription_fini(&sub_rtcm, &node);
+  rcl_subscription_fini(&sub_rtcm_moving_base, &node);
+  rcl_subscription_fini(&sub_rtcm_land,        &node);
   rcl_timer_fini(&timer_imu);
   rclc_executor_fini(&executor);
   rcl_node_fini(&node);
@@ -282,14 +322,26 @@ void setup() {
   Serial1.begin(115200);
   while (!myGNSS.begin(Serial1)) delay(100);
 
+  // Basic rover configuration
   myGNSS.setUART1Output(COM_TYPE_UBX);
   myGNSS.setUART1Input(COM_TYPE_UBX | COM_TYPE_RTCM3);
   myGNSS.setNavigationFrequency(10);
   myGNSS.setDynamicModel(DYN_MODEL_SEA);
+
+  // Enable PVT and RELPOSNED callbacks
   myGNSS.setAutoPVT(true);
   myGNSS.setAutoPVTcallbackPtr(&pvtCallback);
   myGNSS.setAutoRELPOSNED(true);
   myGNSS.setAutoRELPOSNEDcallbackPtr(&relposnedCallback);
+
+  // Enable RELPOSNED output on UART1 and set RTK mode
+  // This is what was previously missing — without this the
+  // F9P will not output RELPOSNED even if it receives Type 4072 RTCM
+  myGNSS.newCfgValset(VAL_LAYER_RAM);
+  myGNSS.addCfgValset(UBLOX_CFG_MSGOUT_UBX_NAV_RELPOSNED_UART1, 1); // enable RELPOSNED
+  myGNSS.addCfgValset(UBLOX_CFG_NAVHPG_DGNSSMODE, 3);               // RTK mode (fixed+float)
+  myGNSS.sendCfgValset();
+
   myGNSS.saveConfiguration();
 
   Wire.begin();
